@@ -1,0 +1,2 @@
+# Absolute path to the Vroff source checkout used for the build.
+VROFF_DIR=/home/your-user/projects/vroff

@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s nullglob
+
+all_targets=(linux-deb linux-rpm linux-appimage linux-zip macos-x64 macos-arm64 windows-x64)
+selected_targets=()
+skip_install=false
+dry_run=false
+interactive=false
+explicit_targets=false
+all_requested=false
+resume=false
+
+usage() {
+  cat <<'EOF'
+Usage: ./release-companion [--interactive] [--resume] [--dry-run] [--skip-install] [--all | TARGET...]
+
+Targets: linux-deb linux-rpm linux-appimage linux-zip macos-x64 macos-arm64 windows-x64
+With no targets, builds every target. Existing release assets are never replaced.
+An unreleased Companion version is published as-is. A normal subsequent release
+bumps its patch version, commits and pushes that version-only Vroff change first.
+
+--resume adds missing assets to the existing version only when it was published
+from the current Vroff commit. Normally this is automatic: unchanged Vroff HEAD
+resumes, while a changed HEAD starts the next patch release.
+
+--dry-run builds and validates artifacts, previews index.json, and makes only
+read-only GitHub requests. It never creates/releases/uploads, commits, pushes,
+or pulls.
+
+--interactive opens a target picker. All targets except windows-x64 are selected
+by default when their required commands are available. Unavailable targets are
+marked with their missing commands and cannot be selected. It cannot be
+combined with --all or explicit targets.
+
+Run directly when the required commands are already on PATH.
+Set VROFF_DIR in the environment or in release-config.local.
+EOF
+}
+
+fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+next_patch_version() {
+  local current=$1
+  if [[ $current =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$((BASH_REMATCH[3] + 1))"
+    return
+  fi
+  fail "automatic patch releases require a stable X.Y.Z version; current version is $current"
+}
+
+bump_companion_version() {
+  local expected=$1 next=$2 package_json="$vroff_dir/packages/ai-companion/package.json" lockfile="$vroff_dir/package-lock.json"
+  node - "$package_json" "$lockfile" "$expected" "$next" <<'EOF'
+const fs = require('node:fs')
+const [packagePath, lockPath, expected, next] = process.argv.slice(2)
+const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
+const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'))
+const workspace = lock.packages?.['packages/ai-companion']
+
+if (packageJson.version !== expected || workspace?.version !== expected) {
+  throw new Error(`Companion version metadata must both be ${expected}`)
+}
+
+packageJson.version = next
+workspace.version = next
+fs.writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`)
+fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`)
+EOF
+}
+
+is_target() {
+  local candidate
+  for candidate in "${all_targets[@]}"; do [[ $candidate == "$1" ]] && return 0; done
+  return 1
+}
+
+# These are the commands used by this helper and by the configured Forge makers.
+# This intentionally checks executables rather than the installed npm tree: unless
+# --skip-install is used, the script installs the npm dependencies itself.
+missing_tools_for_target() {
+  local target=$1 tool
+  local -a required=(node npm git gh jq rg sha256sum)
+
+  case $target in
+    linux-deb) required+=(dpkg fakeroot) ;;
+    linux-rpm) required+=(rpmbuild sed) ;;
+    windows-x64) required+=(mono wine) ;;
+  esac
+
+  local separator=''
+  for tool in "${required[@]}"; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      printf '%s%s' "$separator" "$tool"
+      separator=', '
+    fi
+  done
+}
+
+while (( $# )); do
+  case $1 in
+    --all) selected_targets=("${all_targets[@]}"); explicit_targets=true; all_requested=true ;;
+    --interactive) interactive=true ;;
+    --resume) resume=true ;;
+    --dry-run) dry_run=true ;;
+    --skip-install) skip_install=true ;;
+    --help|-h) usage; exit 0 ;;
+    *) is_target "$1" || fail "unknown target: $1"; explicit_targets=true; selected_targets+=("$1") ;;
+  esac
+  shift
+done
+
+# With no target choice, use the safe picker. --all remains available for
+# non-interactive automation.
+if ! $interactive && ! $explicit_targets; then
+  interactive=true
+fi
+
+if $interactive; then
+  $explicit_targets && fail '--interactive cannot be combined with --all or explicit targets'
+  [[ -t 0 ]] || fail '--interactive requires a terminal; specify targets explicitly instead'
+
+  picker_targets=(windows-x64 linux-deb linux-rpm linux-appimage linux-zip macos-x64 macos-arm64)
+  picker_labels=('Windows (.exe)' 'Linux (.deb)' 'Linux (.rpm)' 'Linux (AppImage)' 'Linux (.zip)' 'macOS (Intel)' 'macOS (Apple silicon)')
+  picker_selected=()
+  picker_missing=()
+  for index in "${!picker_targets[@]}"; do
+    picker_missing[index]=$(missing_tools_for_target "${picker_targets[index]}")
+    if [[ -z ${picker_missing[index]} && ${picker_targets[index]} != windows-x64 ]]; then
+      picker_selected[index]=true
+    else
+      picker_selected[index]=false
+    fi
+  done
+  picker_index=0
+
+  render_picker() {
+    printf '\033[2J\033[H'
+    printf 'Choose Companion release targets\n\n'
+    printf '  Up/Down or p/n: move   Space: toggle/down   Backspace: toggle/up   Enter: continue   q: cancel\n'
+    printf '  [-] means this system is missing a required command for that target.\n\n'
+    local index marker cursor suffix
+    for index in "${!picker_targets[@]}"; do
+      marker='[ ]'
+      suffix=''
+      if [[ -n ${picker_missing[index]} ]]; then
+        marker='[-]'
+        suffix=" (missing: ${picker_missing[index]})"
+      elif ${picker_selected[index]}; then
+        marker='[x]'
+      fi
+      cursor=' '
+      (( index == picker_index )) && cursor='>'
+      printf '%s %s %s%s\n' "$cursor" "$marker" "${picker_labels[index]}" "$suffix"
+    done
+  }
+
+  while true; do
+    render_picker
+    key=''
+    IFS= read -rsn1 key || true
+    case $key in
+      $'\x1b')
+        sequence=''
+        IFS= read -rsn2 -t 0.1 sequence || true
+        case $sequence in
+          '[A') if (( picker_index > 0 )); then picker_index=$((picker_index - 1)); fi ;;
+          '[B') if (( picker_index < ${#picker_targets[@]} - 1 )); then picker_index=$((picker_index + 1)); fi ;;
+        esac
+        ;;
+      p) if (( picker_index > 0 )); then picker_index=$((picker_index - 1)); fi ;;
+      n) if (( picker_index < ${#picker_targets[@]} - 1 )); then picker_index=$((picker_index + 1)); fi ;;
+      ' '|$'\x08'|$'\x7f')
+        [[ -n ${picker_missing[picker_index]} ]] && continue
+        if ${picker_selected[picker_index]}; then
+          picker_selected[picker_index]=false
+        else
+          picker_selected[picker_index]=true
+        fi
+        if [[ $key == ' ' ]] && (( picker_index < ${#picker_targets[@]} - 1 )); then
+          picker_index=$((picker_index + 1))
+        elif [[ $key != ' ' ]] && (( picker_index > 0 )); then
+          picker_index=$((picker_index - 1))
+        fi
+        ;;
+      '') break ;;
+      q|Q) printf '\nSelection cancelled.\n'; exit 0 ;;
+    esac
+  done
+
+  selected_targets=()
+  for index in "${!picker_targets[@]}"; do
+    ${picker_selected[index]} && selected_targets+=("${picker_targets[index]}")
+  done
+else
+  (( ${#selected_targets[@]} )) || selected_targets=("${all_targets[@]}")
+fi
+(( ${#selected_targets[@]} )) || { printf 'No targets selected.\n'; exit 0; }
+
+available_targets=()
+unavailable_targets=()
+for target in "${selected_targets[@]}"; do
+  missing=$(missing_tools_for_target "$target")
+  if [[ -n $missing ]]; then
+    unavailable_targets+=("$target (missing: $missing)")
+  else
+    available_targets+=("$target")
+  fi
+done
+
+if (( ${#unavailable_targets[@]} )); then
+  printf 'Unavailable targets on this system:\n' >&2
+  printf '  - %s\n' "${unavailable_targets[@]}" >&2
+  if $explicit_targets && ! $all_requested; then
+    fail 'install the missing commands before building this target'
+  fi
+  printf 'Skipping unavailable targets.\n' >&2
+fi
+selected_targets=("${available_targets[@]}")
+(( ${#selected_targets[@]} )) || fail 'no selected target has all required commands'
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+release_root=$(git -C "$script_dir" rev-parse --show-toplevel)
+config_file="$release_root/release-config.local"
+[[ -r $config_file ]] && source "$config_file"
+vroff_dir=${VROFF_DIR:-}
+
+[[ -n $vroff_dir ]] || fail "set VROFF_DIR in $config_file or the environment"
+[[ -d $vroff_dir/.git ]] || fail "VROFF_DIR is not a Vroff checkout: $vroff_dir"
+if ! $dry_run; then
+  [[ -z $(git -C "$release_root" status --porcelain) ]] || fail 'release repository has uncommitted changes'
+fi
+[[ -z $(git -C "$vroff_dir" status --porcelain) ]] || fail 'Vroff checkout has uncommitted changes'
+git -C "$vroff_dir" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1 \
+  || fail 'Vroff HEAD has no upstream branch'
+git -C "$vroff_dir" merge-base --is-ancestor HEAD '@{upstream}' \
+  || fail 'Vroff HEAD is not pushed to its upstream branch'
+if ! $dry_run; then
+  git -C "$release_root" pull --ff-only
+fi
+
+release_repo=$(cd "$release_root" && gh repo view --json nameWithOwner --jq .nameWithOwner)
+visibility=$(gh repo view "$release_repo" --json visibility --jq .visibility)
+[[ $visibility == PUBLIC ]] || fail "release repository must be public; current visibility is $visibility"
+
+version=$(node -p "require(${vroff_dir@Q} + '/packages/ai-companion/package.json').version")
+release_tag="v$version"
+source_commit=$(git -C "$vroff_dir" rev-parse HEAD)
+source_remote=$(git -C "$vroff_dir" remote get-url origin)
+release_exists=false
+release_body=''
+if gh api "repos/$release_repo/git/ref/tags/$release_tag" >/dev/null 2>&1; then
+  release_exists=true
+  release_body=$(gh release view "$release_tag" --repo "$release_repo" --json body --jq .body) \
+    || fail "tag $release_tag exists but has no GitHub Release"
+fi
+
+if $release_exists; then
+  release_source_commit=$(printf '%s\n' "$release_body" | rg -o '[0-9a-f]{40}' | head -n 1 || true)
+  [[ -n $release_source_commit ]] \
+    || fail "$release_tag has no readable source commit; refusing to mix artifacts from an unknown build"
+
+  if $resume; then
+    [[ $release_source_commit == "$source_commit" ]] \
+      || fail "$release_tag was published from $release_source_commit, but Vroff HEAD is $source_commit; --resume cannot mix source commits"
+    printf 'Resuming Vroff AI Companion %s from %s\n' "$version" "$source_commit"
+  elif [[ $release_source_commit == "$source_commit" ]]; then
+    printf 'Resuming Vroff AI Companion %s from %s\n' "$version" "$source_commit"
+  else
+    next_version=$(next_patch_version "$version")
+    next_tag="v$next_version"
+    if $dry_run; then
+      fail "$release_tag is from $release_source_commit; a normal run would create $next_tag from $source_commit. Dry runs do not modify or commit the Vroff checkout."
+    fi
+    if gh api "repos/$release_repo/git/ref/tags/$next_tag" >/dev/null 2>&1; then
+      fail "$next_tag already exists; reconcile the Companion version before creating another release"
+    fi
+
+    printf 'Bumping Vroff AI Companion %s -> %s\n' "$version" "$next_version"
+    bump_companion_version "$version" "$next_version"
+    git -C "$vroff_dir" add packages/ai-companion/package.json package-lock.json
+    git -C "$vroff_dir" commit -m "Bump Vroff AI Companion to $next_version"
+    git -C "$vroff_dir" push
+
+    version=$next_version
+    release_tag=$next_tag
+    source_commit=$(git -C "$vroff_dir" rev-parse HEAD)
+    release_exists=false
+  fi
+elif $resume; then
+  fail "cannot resume $release_tag because it has not been published"
+fi
+
+printf 'Preparing Vroff AI Companion %s from %s\n' "$version" "$source_commit"
+printf 'Targets: %s\n' "${selected_targets[*]}"
+$dry_run && printf 'Mode: dry run (no remote or repository writes)\n'
+
+if ! $skip_install; then
+  (cd "$vroff_dir" && npm ci && npm install --prefix packages/ai-companion --install-strategy=nested --package-lock=false --workspaces=false) \
+    || fail 'dependency installation failed'
+fi
+
+make_dir="$vroff_dir/packages/ai-companion/out/make"
+stage_dir=$(mktemp -d)
+trap 'rm -rf "$stage_dir"' EXIT
+successful_targets=()
+staged_assets=()
+
+stage_asset() {
+  local target=$1 source=$2 asset_name=$3
+  [[ -f $source ]] || { warn "$target did not produce its expected artifact: $source"; return 1; }
+  cp "$source" "$stage_dir/$asset_name"
+  sha256sum "$stage_dir/$asset_name" > "$stage_dir/$asset_name.sha256"
+  successful_targets+=("$target")
+  staged_assets+=("$stage_dir/$asset_name")
+}
+
+make_rpm() {
+  local rpmbuild_path rpm_wrapper_dir rpm_db
+  rpmbuild_path=$(command -v rpmbuild)
+  rpm_wrapper_dir=$(mktemp -d "$stage_dir/rpmbuild.XXXXXX")
+  rpm_db="$rpm_wrapper_dir/db"
+  mkdir -p "$rpm_db"
+
+  # electron-installer-redhat places files in <topdir>/BUILD/usr and expects
+  # %install to start in <topdir>/BUILD. RPM 4.20 instead enters a generated
+  # BUILD/<name>-<version>-build directory. Adjust only that temporary spec's
+  # source path, and use an isolated RPM database.
+  cat > "$rpm_wrapper_dir/rpmbuild" <<EOF
+#!/bin/sh
+spec=''
+previous=''
+for argument in "\$@"; do
+  if [ "\$previous" = '-bb' ]; then
+    spec="\$argument"
+    break
+  fi
+  previous="\$argument"
+done
+if [ -n "\$spec" ]; then
+  sed -i 's#cp -r usr/\\*#cp -r ../usr/*#' "\$spec"
+fi
+exec "$rpmbuild_path" --define "_dbpath $rpm_db" "\$@"
+EOF
+  chmod +x "$rpm_wrapper_dir/rpmbuild"
+
+  (cd "$vroff_dir" && PATH="$rpm_wrapper_dir:$PATH" npm run make --workspace=@vroff/ai-companion -- --platform linux --targets @electron-forge/maker-rpm)
+}
+
+build_target() {
+  local target=$1 source asset_name
+  case $target in
+    linux-deb)
+      source="$make_dir/deb/x64/vroff-ai-companion_${version}_amd64.deb"; asset_name="vroff-ai-companion_${version}_amd64.deb"; rm -f "$source"
+      (cd "$vroff_dir" && npm run make --workspace=@vroff/ai-companion -- --platform linux --targets @electron-forge/maker-deb) || { warn "$target build failed"; return; }
+      ;;
+    linux-rpm)
+      rm -f "$make_dir"/rpm/x64/*"$version"*.rpm
+      make_rpm || { warn "$target build failed"; return; }
+      local rpm_candidates=("$make_dir"/rpm/x64/*"$version"*.rpm)
+      (( ${#rpm_candidates[@]} == 1 )) || { warn "$target expected exactly one RPM for $version, found ${#rpm_candidates[@]}"; return; }
+      source=${rpm_candidates[0]}; asset_name="vroff-ai-companion-${version}-x86_64.rpm"
+      ;;
+    linux-appimage)
+      source="$make_dir/@vroffai-companion-${version}.AppImage"; asset_name="vroff-ai-companion-${version}-x86_64.AppImage"; rm -f "$source"
+      (cd "$vroff_dir" && npm run make --workspace=@vroff/ai-companion -- --platform linux --arch x64 --targets appimage) || { warn "$target build failed"; return; }
+      ;;
+    linux-zip)
+      source="$make_dir/zip/linux/x64/Vroff AI Companion-linux-x64-${version}.zip"; asset_name="vroff-ai-companion-${version}-linux-x64.zip"; rm -f "$source"
+      (cd "$vroff_dir" && npm run make --workspace=@vroff/ai-companion -- --platform linux --targets @electron-forge/maker-zip) || { warn "$target build failed"; return; }
+      ;;
+    macos-x64)
+      source="$make_dir/zip/darwin/x64/Vroff AI Companion-darwin-x64-${version}.zip"; asset_name="vroff-ai-companion-${version}-macos-x64.zip"; rm -f "$source"
+      (cd "$vroff_dir" && npm run make --workspace=@vroff/ai-companion -- --platform darwin --arch x64 --targets @electron-forge/maker-zip) || { warn "$target build failed"; return; }
+      ;;
+    macos-arm64)
+      source="$make_dir/zip/darwin/arm64/Vroff AI Companion-darwin-arm64-${version}.zip"; asset_name="vroff-ai-companion-${version}-macos-arm64.zip"; rm -f "$source"
+      (cd "$vroff_dir" && npm run make --workspace=@vroff/ai-companion -- --platform darwin --arch arm64 --targets @electron-forge/maker-zip) || { warn "$target build failed"; return; }
+      ;;
+    windows-x64)
+      source="$make_dir/squirrel.windows/x64/Vroff AI Companion-${version} Setup.exe"; asset_name="vroff-ai-companion-${version}-windows-x64-setup.exe"; rm -f "$source"
+      (cd "$vroff_dir" && npm run make --workspace=@vroff/ai-companion -- --platform win32 --arch x64 --targets @electron-forge/maker-squirrel) || { warn "$target build failed"; return; }
+      ;;
+  esac
+  stage_asset "$target" "$source" "$asset_name" || true
+}
+
+for target in "${selected_targets[@]}"; do build_target "$target"; done
+(( ${#successful_targets[@]} )) || fail 'no selected target produced an artifact; no release was changed'
+
+if ! $release_exists; then
+  if $dry_run; then
+    printf 'Would create GitHub Release %s\n' "$release_tag"
+  else
+    gh release create "$release_tag" --repo "$release_repo" --title "Vroff AI Companion $version" --notes "Source repository: $source_remote
+Source commit: $source_commit"
+  fi
+fi
+
+existing_assets=''
+if $release_exists; then
+  existing_assets=$(gh release view "$release_tag" --repo "$release_repo" --json assets --jq '.assets[].name')
+fi
+updated_targets=()
+for index in "${!successful_targets[@]}"; do
+  target=${successful_targets[index]}; asset=${staged_assets[index]}; asset_name=$(basename "$asset")
+  if printf '%s\n' "$existing_assets" | rg -qxF "$asset_name"; then
+    warn "$target was not uploaded because $asset_name already exists in $release_tag"
+    continue
+  fi
+  if $dry_run; then
+    printf 'Would upload %s and %s.sha256 to %s\n' "$asset_name" "$asset_name" "$release_tag"
+    updated_targets+=("$target")
+    continue
+  fi
+  if gh release upload "$release_tag" "$asset" --repo "$release_repo"; then
+    gh release upload "$release_tag" "$asset.sha256" --repo "$release_repo" || warn "uploaded $asset_name but not its checksum sidecar"
+    updated_targets+=("$target")
+  else
+    warn "$target upload failed"
+  fi
+done
+
+if (( ! ${#updated_targets[@]} )); then
+  printf 'No new artifacts were uploaded; index.json was left unchanged.\n'
+  exit 0
+fi
+
+index_output="$release_root/index.json"
+if $dry_run; then
+  index_output="$stage_dir/index.json"
+fi
+
+node - "$release_root/index.json" "$index_output" "$release_repo" "$release_tag" "${updated_targets[@]}" <<'EOF'
+const fs = require('node:fs')
+const [indexPath, outputPath, releaseRepo, releaseTag, ...updatedTargets] = process.argv.slice(2)
+const version = releaseTag.slice(1)
+const definitions = {
+  'linux-deb': { id: 'linux-deb-x64', label: 'Linux (.deb)', platform: 'linux', arch: 'x64', asset: `vroff-ai-companion_${version}_amd64.deb` },
+  'linux-rpm': { id: 'linux-rpm-x64', label: 'Linux (.rpm)', platform: 'linux', arch: 'x64', asset: `vroff-ai-companion-${version}-x86_64.rpm` },
+  'linux-appimage': { id: 'linux-appimage-x64', label: 'Linux (AppImage)', platform: 'linux', arch: 'x64', asset: `vroff-ai-companion-${version}-x86_64.AppImage` },
+  'linux-zip': { id: 'linux-zip-x64', label: 'Linux (.zip)', platform: 'linux', arch: 'x64', asset: `vroff-ai-companion-${version}-linux-x64.zip` },
+  'macos-x64': { id: 'macos-x64', label: 'macOS (Intel)', platform: 'macos', arch: 'x64', asset: `vroff-ai-companion-${version}-macos-x64.zip` },
+  'macos-arm64': { id: 'macos-arm64', label: 'macOS (Apple silicon)', platform: 'macos', arch: 'arm64', asset: `vroff-ai-companion-${version}-macos-arm64.zip` },
+  'windows-x64': { id: 'windows-x64', label: 'Windows (.exe)', platform: 'windows', arch: 'x64', asset: `vroff-ai-companion-${version}-windows-x64-setup.exe` },
+}
+const index = JSON.parse(fs.readFileSync(indexPath, 'utf8'))
+if (index.version !== 1 || !Array.isArray(index.downloads)) throw new Error('index.json must contain version 1 and a downloads array')
+const updates = updatedTargets.map((target) => {
+  const definition = definitions[target]
+  if (!definition) throw new Error(`unknown target: ${target}`)
+  const { asset, ...download } = definition
+  return { ...download, url: `https://github.com/${releaseRepo}/releases/download/${releaseTag}/${asset}` }
+})
+const updatedIds = new Set(updates.map(({ id }) => id))
+const downloads = [...index.downloads.filter(({ id }) => !updatedIds.has(id)), ...updates]
+fs.writeFileSync(outputPath, `${JSON.stringify({ version: 1, downloads }, null, 2)}\n`)
+EOF
+
+if $dry_run; then
+  printf 'index.json preview:\n'
+  if git diff --no-index -- "$release_root/index.json" "$index_output"; then
+    printf 'index.json would not change.\n'
+  else
+    diff_status=$?
+    (( diff_status == 1 )) || fail 'could not generate index.json preview'
+  fi
+  printf 'Dry run completed; no release, upload, commit, push, or pull was performed.\n'
+  exit 0
+fi
+
+git -C "$release_root" add index.json
+git -C "$release_root" commit -m "Publish Vroff AI Companion $version"
+git -C "$release_root" push
+printf 'Updated index.json for: %s\n' "${updated_targets[*]}"
