@@ -46,8 +46,8 @@ in the release for the current Companion version:
 
 - If Vroff HEAD is unchanged, it resumes that release and uploads only missing
   selected platform artifacts.
-- If Vroff HEAD has changed, it bumps the patch version (for example, `1.0.0`
-  to `1.0.1`), commits and pushes that version-only Vroff change, then builds
+- If Vroff HEAD has changed, it bumps the minor version (for example, `1.0.9`
+  to `1.1.0`), commits and pushes that version-only Vroff change, then builds
   and publishes the new release.
 
 Every tester build therefore has an immutable version and download URL, while a
