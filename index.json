@@ -37,18 +37,18 @@
       "url": "https://github.com/btelltime/vroff-ai-companion-testing/releases/download/v1.0.0/vroff-ai-companion-1.0.0-macos-arm64.zip"
     },
     {
-      "id": "linux-deb-x64",
-      "label": "Linux (.deb)",
-      "platform": "linux",
-      "arch": "x64",
-      "url": "https://github.com/btelltime/vroff-ai-companion-testing/releases/download/v1.0.3/vroff-ai-companion_1.0.3_amd64.deb"
-    },
-    {
       "id": "linux-appimage-x64",
       "label": "Linux (AppImage)",
       "platform": "linux",
       "arch": "x64",
       "url": "https://github.com/btelltime/vroff-ai-companion-testing/releases/download/v1.0.3/vroff-ai-companion-1.0.3-x86_64.AppImage"
+    },
+    {
+      "id": "linux-deb-x64",
+      "label": "Linux (.deb)",
+      "platform": "linux",
+      "arch": "x64",
+      "url": "https://github.com/btelltime/vroff-ai-companion-testing/releases/download/v1.0.4/vroff-ai-companion_1.0.4_amd64.deb"
     }
   ]
 }
