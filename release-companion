@@ -18,11 +18,11 @@ Usage: ./release-companion [--interactive] [--resume] [--dry-run] [--skip-instal
 Targets: linux-deb linux-rpm linux-appimage linux-zip macos-x64 macos-arm64 windows-x64
 With no targets, builds every target. Existing release assets are never replaced.
 An unreleased Companion version is published as-is. A normal subsequent release
-bumps its minor version, commits and pushes that version-only Vroff change first.
+bumps its patch version, commits and pushes that version-only Vroff change first.
 
 --resume adds missing assets to the existing version only when it was published
 from the current Vroff commit. Normally this is automatic: unchanged Vroff HEAD
-resumes, while a changed HEAD starts the next minor release.
+resumes, while a changed HEAD starts the next patch release.
 
 --dry-run builds and validates artifacts, previews index.json, and makes only
 read-only GitHub requests. It never creates/releases/uploads, commits, pushes,
@@ -41,13 +41,20 @@ EOF
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 
-next_minor_version() {
+next_patch_version() {
   local current=$1
   if [[ $current =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-    printf '%s.%s.0\n' "${BASH_REMATCH[1]}" "$((BASH_REMATCH[2] + 1))"
+    local major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+    if (( patch < 9 )); then
+      printf '%s.%s.%s\n' "$major" "$minor" "$((patch + 1))"
+    elif (( minor < 9 )); then
+      printf '%s.%s.0\n' "$major" "$((minor + 1))"
+    else
+      printf '%s.0.0\n' "$((major + 1))"
+    fi
     return
   fi
-  fail "automatic minor releases require a stable X.Y.Z version; current version is $current"
+  fail "automatic patch releases require a stable X.Y.Z version; current version is $current"
 }
 
 bump_companion_version() {
@@ -273,7 +280,7 @@ if $release_exists; then
   elif [[ $release_source_commit == "$source_commit" ]]; then
     printf 'Resuming Vroff AI Companion %s from %s\n' "$version" "$source_commit"
   else
-    next_version=$(next_minor_version "$version")
+    next_version=$(next_patch_version "$version")
     next_tag="v$next_version"
     if $dry_run; then
       fail "$release_tag is from $release_source_commit; a normal run would create $next_tag from $source_commit. Dry runs do not modify or commit the Vroff checkout."
