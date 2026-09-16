@@ -280,7 +280,7 @@ if $release_exists; then
     printf 'Bumping Vroff AI Companion %s -> %s\n' "$version" "$next_version"
     bump_companion_version "$version" "$next_version"
     git -C "$vroff_dir" add packages/ai-companion/package.json package-lock.json
-    git -C "$vroff_dir" commit -m "Bump Vroff AI Companion to $next_version"
+    git -C "$vroff_dir" commit -m "chore(ai-companion): bump version to $next_version"
     git -C "$vroff_dir" push
 
     version=$next_version
