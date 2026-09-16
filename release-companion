@@ -250,10 +250,15 @@ source_commit=$(git -C "$vroff_dir" rev-parse HEAD)
 source_remote=$(git -C "$vroff_dir" remote get-url origin)
 release_exists=false
 release_body=''
-if gh api "repos/$release_repo/git/ref/tags/$release_tag" >/dev/null 2>&1; then
+release_was_draft=false
+# gh release view (not the git tag ref) is the source of truth here: a draft release
+# reserves its tag name but does not create a real git tag ref until it is published,
+# so a run interrupted between "created as draft" and "published" must still be found
+# as existing on the next invocation instead of colliding with a duplicate create.
+if release_json=$(gh release view "$release_tag" --repo "$release_repo" --json body,isDraft 2>/dev/null); then
   release_exists=true
-  release_body=$(gh release view "$release_tag" --repo "$release_repo" --json body --jq .body) \
-    || fail "tag $release_tag exists but has no GitHub Release"
+  release_body=$(printf '%s' "$release_json" | jq -r .body)
+  [[ $(printf '%s' "$release_json" | jq -r .isDraft) == true ]] && release_was_draft=true
 fi
 
 if $release_exists; then
@@ -273,7 +278,7 @@ if $release_exists; then
     if $dry_run; then
       fail "$release_tag is from $release_source_commit; a normal run would create $next_tag from $source_commit. Dry runs do not modify or commit the Vroff checkout."
     fi
-    if gh api "repos/$release_repo/git/ref/tags/$next_tag" >/dev/null 2>&1; then
+    if gh release view "$next_tag" --repo "$release_repo" >/dev/null 2>&1; then
       fail "$next_tag already exists; reconcile the Companion version before creating another release"
     fi
 
@@ -287,6 +292,7 @@ if $release_exists; then
     release_tag=$next_tag
     source_commit=$(git -C "$vroff_dir" rev-parse HEAD)
     release_exists=false
+    release_was_draft=false
   fi
 elif $resume; then
   fail "cannot resume $release_tag because it has not been published"
@@ -389,12 +395,20 @@ build_target() {
 for target in "${selected_targets[@]}"; do build_target "$target"; done
 (( ${#successful_targets[@]} )) || fail 'no selected target produced an artifact; no release was changed'
 
+# Also true when resuming a release left in draft by an earlier interrupted run — it
+# still needs publishing once this run's uploads finish, same as a freshly created one.
+created_as_draft=$release_was_draft
 if ! $release_exists; then
   if $dry_run; then
     printf 'Would create GitHub Release %s\n' "$release_tag"
   else
-    gh release create "$release_tag" --repo "$release_repo" --title "Vroff AI Companion $version" --notes "Source repository: $source_remote
+    # Created as a draft so it never appears via the public "latest release" API — and
+    # so an installed Companion checking for updates never sees this tag — until every
+    # asset below has actually finished uploading. Without this, a client that checks
+    # mid-upload can see a release with no (or checksum-less) assets for its platform.
+    gh release create "$release_tag" --repo "$release_repo" --draft --title "Vroff AI Companion $version" --notes "Source repository: $source_remote
 Source commit: $source_commit"
+    created_as_draft=true
   fi
 fi
 
@@ -415,12 +429,28 @@ for index in "${!successful_targets[@]}"; do
     continue
   fi
   if gh release upload "$release_tag" "$asset" --repo "$release_repo"; then
-    gh release upload "$release_tag" "$asset.sha256" --repo "$release_repo" || warn "uploaded $asset_name but not its checksum sidecar"
-    updated_targets+=("$target")
+    if gh release upload "$release_tag" "$asset.sha256" --repo "$release_repo"; then
+      updated_targets+=("$target")
+    else
+      # An asset without its checksum sidecar is exactly the unsafe half-state the draft
+      # release is meant to prevent — remove it rather than publish it that way. The next
+      # run (or --resume) will just see it missing and upload it again.
+      warn "$target uploaded but its checksum sidecar failed; removing the orphaned asset"
+      gh release delete-asset "$release_tag" "$asset_name" --repo "$release_repo" --yes \
+        || warn "could not remove orphaned $asset_name — remove it manually before this release is trusted"
+    fi
   else
     warn "$target upload failed"
   fi
 done
+
+if $created_as_draft && ! $dry_run; then
+  if gh release edit "$release_tag" --repo "$release_repo" --draft=false; then
+    printf 'Published %s (all uploads finished).\n' "$release_tag"
+  else
+    warn "could not publish $release_tag out of draft; every asset uploaded, but the release is not publicly visible yet — run 'gh release edit $release_tag --repo $release_repo --draft=false' once ready"
+  fi
+fi
 
 if (( ! ${#updated_targets[@]} )); then
   printf 'No new artifacts were uploaded; index.json was left unchanged.\n'
